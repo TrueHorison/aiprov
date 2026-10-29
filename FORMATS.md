@@ -103,6 +103,41 @@ Status key: **Confirmed** = exact text seen in docs or source and in real commit
   - Spec: https://github.com/git-ai-project/git-ai/blob/main/specs/git_ai_standard_v3.0.0.md
   - Repo: https://github.com/git-ai-project/git-ai
 
+## 8. AI review bots that co-author applied suggestions (checked 2026-10-29)
+
+aiprov reports these as kind `AI review bot (applied suggestion)`, apart from coding tools.
+
+How the trailer gets there: a review bot posts a suggested change on a pull request. When a person clicks "Commit suggestion" (or "Add suggestion to batch"), GitHub adds each person or bot that suggested a change as a co-author. GitHub's docs say: "Each person who suggested a change included in the commit will be a co-author of the commit." The human who applies it stays the author. After a squash merge, the trailer lines of all squashed commits end up in the message body, often repeated many times. aiprov reads them anywhere in the message and keeps each once.
+
+| Bot (account) | Exact co-author line seen in real commits | Real commit | Status |
+|---|---|---|---|
+| Gemini Code Assist (`gemini-code-assist[bot]`, id 176961590) | `Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>` | https://github.com/project-chip/matter-handbook/commit/b0c1fd40c2 and https://github.com/tjorim/pyrail/commit/d62ef5d0 | Confirmed |
+| Gemini Code Assist, no id in email | `Co-authored-by: gemini-code-assist[bot] <gemini-code-assist[bot]@users.noreply.github.com>` | https://github.com/juninmd/shorts-generator/commit/3f0cc508a4 | Confirmed |
+| Gemini Code Assist, other display name | `Co-authored-by: Antigravity <gemini-code-assist[bot]@users.noreply.github.com>` | https://github.com/rmems/Theseus-Quarry/commit/138dd36ec2 | Confirmed (name differs, same account) |
+| CodeRabbit (`coderabbitai[bot]`, id 136622811) | `Co-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>` | https://github.com/Ferrocite/ferrox/commit/e658549bd5, https://github.com/fossasia/eventyay-checkin/commit/18468c7fd0 | Confirmed |
+| CodeRabbit EU (`coderabbiteu[bot]`) | `Co-authored-by: coderabbiteu[bot] <274295283+coderabbiteu[bot]@users.noreply.github.com>` | https://github.com/NicolasDiCostanzo/OpenCertCraft/commit/614c492cda | Confirmed (one repo seen) |
+| GitHub Copilot code review (`copilot-pull-request-reviewer[bot]`, id 175728472) | `Co-authored-by: copilot-pull-request-reviewer[bot] <175728472+copilot-pull-request-reviewer[bot]@users.noreply.github.com>` | https://github.com/Fueled/oss-metrics/commit/b38d1f49c1 | Confirmed |
+| Copilot code review, no id | `Co-authored-by: copilot-pull-request-reviewer <copilot-pull-request-reviewer@users.noreply.github.com>` | https://github.com/microsoft/finops-toolkit/commit/5b6428c9b1 | Confirmed |
+| Copilot code review, github.com email | `Co-authored-by: Copilot <copilot-pull-request-reviewer@github.com>` | https://github.com/microbiomedata/nmdc-schema/commit/02245dcf83 | Confirmed |
+| Copilot code review, shown as "Copilot" | `Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>` | https://github.com/yutto-dev/yutto/commit/c40272a80c | Confirmed |
+| Sourcery (`sourcery-ai[bot]`, id 58596630) | `Co-authored-by: sourcery-ai[bot] <58596630+sourcery-ai[bot]@users.noreply.github.com>` | https://github.com/fossasia/eventyay-checkin/commit/18468c7fd0 | Confirmed |
+| Qodo (`qodo-code-review[bot]`) | `Co-authored-by: qodo-code-review[bot] <151058649+qodo-code-review[bot]@users.noreply.github.com>` (also seen without the id) | https://github.com/fleekdash/extensions/commit/734483cc83 | Confirmed |
+| Greptile (`greptile-apps[bot]`) | `Co-authored-by: greptile-apps[bot] <165735046+greptile-apps[bot]@users.noreply.github.com>` | https://github.com/eduardofrancener/rustdesk/commit/4515cd6463 | Confirmed |
+| cubic (`cubic-dev-ai[bot]`) | `Co-authored-by: cubic-dev-ai[bot] <191113872+cubic-dev-ai[bot]@users.noreply.github.com>` | https://github.com/GLORIFIER7/GLORIFIER/commit/77c8a4707b | Confirmed |
+| OpenAI Codex code review (`chatgpt-codex-connector[bot]`) | `Co-authored-by: chatgpt-codex-connector[bot] <199175422+chatgpt-codex-connector[bot]@users.noreply.github.com>` (the display name is sometimes `Codex (<model>)`) | https://github.com/trvny/trvny/commit/34d3010827 | Confirmed |
+
+How I checked: GitHub commit search (read-only) for each bot name, then read the commit message through the GitHub API. For every row above I read the commit and saw the exact line. Account ids come from `GET /users/<login>` (gemini 176961590, coderabbitai 136622811, sourcery-ai 58596630, copilot-pull-request-reviewer[bot] 175728472, copilot-swe-agent[bot] 198982749). Search turned up many thousands of commits for the first four bots.
+
+What aiprov matches: the email only, never the display name. It takes the part before the `@`, drops a leading `<id>+` and a trailing `[bot]`, and looks that up. The domain must be `users.noreply.github.com` or `github.com`. A human who types a bot's name with some other email is not matched.
+
+Traps found:
+- **The Copilot reviewer shows up as "Copilot".** `175728472+Copilot@users.noreply.github.com` is the code review bot. The Copilot coding agent is `198982749+Copilot@users.noreply.github.com`. aiprov used to read any `<id>+Copilot@...` as the coding agent; it now splits them by id.
+- The id in the email is not always right. One real commit has `197827+copilot-pull-request-reviewer[bot]@...` (yutto-dev/yutto, c40272a80c). So aiprov matches the account name, not the id. The one exception is `Copilot`, where the id is the only way to tell the two apart.
+- Other tools show up in the same lines but are not review bots, so they are not added here: `google-labs-jules[bot]` (Jules, a coding agent), `devin-ai-integration[bot]` (Devin, a coding agent; names `Devin` and `Devin AI`), `Codex <codex@openai.com>` (seen once; not the `noreply@openai.com` form), `Copilot Autofix powered by AI <...>` (code scanning fixes), and `kilocode-bot[bot]`. Jules and Devin would be a good next addition as coding agents. Non-AI bots (`dependabot[bot]`, `github-actions[bot]`, `renovate[bot]`, `codecov[bot]`) are ignored.
+- Some commit messages list many bots at once (for example Juwan-Hwang/Zephyr, 82bf4496a9). I did not use those as evidence for a bot. Only bots seen in a clear single-purpose commit are in the table.
+- Bots I looked for but did not confirm in this pass (GitHub rate limit): Amazon Q Developer, Ellipsis, Korbit, Bito, Graphite, Codeflash, Sweep.
+- Source for the mechanism: https://github.com/github/docs/blob/main/content/pull-requests/how-tos/review-pull-requests/incorporating-feedback-in-your-pull-request.md
+
 ## Standards used for output
 
 - CycloneDX 1.6 JSON schema: https://raw.githubusercontent.com/CycloneDX/specification/1.6/schema/bom-1.6.schema.json

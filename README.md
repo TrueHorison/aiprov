@@ -35,6 +35,8 @@ For each commit between two refs (merge commits are skipped):
   and `Co-authored-by` lines from known AI tools. It also reads the commit author
   (for example `Copilot <198982749+Copilot@users.noreply.github.com>`).
 - If the commit has a git-ai note (`refs/notes/ai`), it reads the exact AI lines from the note.
+- It also reads `Co-authored-by` lines from AI review bots whose suggestions were applied.
+  These are kept apart from coding tools in every output, and their lines are never added to the AI line count.
 - It counts the lines added per file, and how many of them count as AI.
 - It marks each finding with how it knows: `note`, `trailer` or `none`.
 
@@ -47,6 +49,8 @@ Tools it knows today:
 - GitHub Copilot coding agent, and other GitHub cloud agents (unnamed)
 - Cursor, OpenAI Codex and Aider
 - `Assisted-by` stamps, and any tool named in a git-ai note
+- AI review bots (applied suggestions): Gemini Code Assist, CodeRabbit, GitHub Copilot code review,
+  Sourcery, Qodo, Greptile, cubic and OpenAI Codex code review
 
 ## Install and run
 
@@ -88,7 +92,8 @@ Markdown (cut short):
 # AI use in demo v1.1
 
 - Range: `v1.0..v1.1` (ends at `4240db79561b`)
-- Commits: 3 (merge commits skipped). With an AI trace: 2.
+- Commits: 3 (merge commits skipped). With an AI coding tool trace: 2.
+- With an AI review bot as co-author (counted apart, see below): 0.
 - Files changed: 3. Touched by AI commits: 2.
 - Lines added: 57. Counted as AI: 52.
 
@@ -98,6 +103,10 @@ Markdown (cut short):
 |---|---|---|---|---|---|
 | Claude Code | Claude Opus 5.5 | Anthropic | Anthropic | 1 | trailer |
 | GitHub Copilot coding agent | not recorded | GitHub | not recorded | 1 | trailer |
+
+## AI review bots (applied suggestions)
+
+None.
 
 ## Policy check
 
@@ -137,6 +146,7 @@ And the AI tool, under `formulation`:
     "name": "Claude Code",
     "provider": { "name": "Anthropic" },
     "properties": [
+      { "name": "aiprov:kind", "value": "AI coding tool" },
       { "name": "aiprov:model", "value": "Claude Opus 5.5" },
       { "name": "aiprov:model.provider", "value": "Anthropic" },
       { "name": "aiprov:evidence", "value": "trailer" },
@@ -152,6 +162,11 @@ Each AI tool is a `Tool`. The release `usesTool` each AI tool.
 Each AI tool `generates` the files its commits touched.
 Each AI tool is `availableFrom` an `Organization` (the provider).
 Each AI file gets an `Annotation` whose statement starts with `AI Generated`.
+A review bot is a `Tool` too, with `aiprov:kind=AI review bot (applied suggestion)` in its `comment`.
+It gets no `generates` link and no `AI Generated` annotation. Its files get an `Annotation`
+that starts with `AI review bot suggestion` instead.
+In CycloneDX a review bot is a service with `aiprov:kind` set the same way. Its files get
+`aiprov:review.lines`, `aiprov:review.bots` and `aiprov:review.commits`, and no `AI Generated` property.
 
 Both JSON outputs passed the official CycloneDX 1.6 and SPDX 3.0.1 JSON schemas in testing.
 
@@ -183,7 +198,7 @@ This mapping is our choice, not a standard.
 ```
 
 - `allowed_tools`: tool names as aiprov prints them (case does not matter).
-  Every AI use must name a tool on this list.
+  Every AI use must name a tool on this list. This includes AI review bots, for example `Gemini Code Assist`.
 - `allowed_providers`: optional. If given, every known provider of each use must be on it.
   A use has up to two providers. One is the tool vendor, for example GitHub for Copilot.
   The other is the model provider, for example Anthropic for "Claude Opus 5.5".
@@ -210,7 +225,9 @@ If any use fails, aiprov lists the commits on the error stream and exits with `1
 - Merge commits are skipped, so code first written in a merge conflict fix is not counted.
 - Aider can be set to put an `aider: ` subject prefix on all its commits, even ones with human edits only.
   aiprov counts those as AI, so it may over-count. A committer-only `(aider)` mark is not counted.
-- Not handled yet: AI review bots that commit suggested code (for example `gemini-code-assist[bot]`
-  and `coderabbitai[bot]` as co-authors) are not yet read. Codex and Aider stamps were checked in their
-  source but not yet seen in a real public commit.
+- AI review bots (for example `gemini-code-assist[bot]` and `coderabbitai[bot]`) appear as co-authors when
+  someone applies their suggestion. aiprov lists them in their own section. It never counts their lines as AI.
+  The bot wrote only the suggested lines, and the rest of the commit may be human.
+  It reads a fixed list of bots by their email, so a bot not on the list is not seen.
+- Codex and Aider stamps were checked in their source but not yet seen in a real public commit.
 - Formats change. `FORMATS.md` lists each one with its source and the date it was checked.

@@ -395,6 +395,230 @@ class TestPolicyAndOutput(Base):
         self.assertIn("Commits: 4", out)
 
 
+REVIEW_LINES = [
+    ("Gemini Code Assist", "Google",
+     "Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>"),
+    ("Gemini Code Assist", "Google",
+     "Co-authored-by: gemini-code-assist[bot] <gemini-code-assist[bot]@users.noreply.github.com>"),
+    ("Gemini Code Assist", "Google",
+     "Co-authored-by: Antigravity <gemini-code-assist[bot]@users.noreply.github.com>"),
+    ("CodeRabbit", "CodeRabbit",
+     "Co-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>"),
+    ("CodeRabbit", "CodeRabbit",
+     "Co-authored-by: coderabbiteu[bot] <274295283+coderabbiteu[bot]@users.noreply.github.com>"),
+    ("GitHub Copilot code review", "GitHub",
+     "Co-authored-by: copilot-pull-request-reviewer[bot] "
+     "<175728472+copilot-pull-request-reviewer[bot]@users.noreply.github.com>"),
+    ("GitHub Copilot code review", "GitHub",
+     "Co-authored-by: copilot-pull-request-reviewer <copilot-pull-request-reviewer@users.noreply.github.com>"),
+    ("GitHub Copilot code review", "GitHub",
+     "Co-authored-by: Copilot <copilot-pull-request-reviewer@github.com>"),
+    ("GitHub Copilot code review", "GitHub",
+     "Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>"),
+    ("Sourcery", "Sourcery",
+     "Co-authored-by: sourcery-ai[bot] <58596630+sourcery-ai[bot]@users.noreply.github.com>"),
+    ("Qodo code review", "Qodo",
+     "Co-authored-by: qodo-code-review[bot] <151058649+qodo-code-review[bot]@users.noreply.github.com>"),
+    ("Greptile", "Greptile",
+     "Co-authored-by: greptile-apps[bot] <165735046+greptile-apps[bot]@users.noreply.github.com>"),
+    ("cubic", "cubic",
+     "Co-authored-by: cubic-dev-ai[bot] <191113872+cubic-dev-ai[bot]@users.noreply.github.com>"),
+    ("OpenAI Codex code review", "OpenAI",
+     "Co-authored-by: chatgpt-codex-connector[bot] "
+     "<199175422+chatgpt-codex-connector[bot]@users.noreply.github.com>"),
+    ("OpenAI Codex code review", "OpenAI",
+     "Co-authored-by: Codex (some-model) <199175422+chatgpt-codex-connector[bot]@users.noreply.github.com>"),
+]
+
+
+class TestReviewBots(Base):
+    def test_each_bot_line_is_detected(self):
+        for name, vendor, line in REVIEW_LINES:
+            with self.subTest(line=line):
+                self.r.commit({"f.py": line + "\n"}, f"apply suggestion {SECRET}\n\n{line}\n")
+                c = self.walk()[-1]
+                self.assertEqual([u.name for u in c.uses], [name])
+                u = c.uses[0]
+                self.assertEqual(u.kind, aiprov.KIND_REVIEW)
+                self.assertEqual(u.vendor, vendor)
+                self.assertEqual(u.evidence, "trailer")
+                self.assertEqual(u.traces, [line])
+                self.assertIsNone(u.model)
+
+    def test_not_a_review_bot(self):
+        self.r.commit({"a.py": "x\n"}, "a\n\nCo-authored-by: coderabbitai[bot] <someone@example.com>\n")
+        self.r.commit({"b.py": "x\n"}, "b\n\nCo-authored-by: gemini-code-assist[bot] "
+                                       "<gemini-code-assist[bot]@users.noreply.example.com>\n")
+        self.r.commit({"c.py": "x\n"}, "c\n\nCo-authored-by: dependabot[bot] "
+                                       "<49699333+dependabot[bot]@users.noreply.github.com>\n")
+        self.r.commit({"d.py": "x\n"}, "d\n\nCo-authored-by: Real Person "
+                                       "<5+greptile-apps-fan@users.noreply.github.com>\n")
+        self.assertEqual([c.uses for c in self.walk()], [[], [], [], []])
+
+    def test_copilot_reviewer_id_is_not_the_coding_agent(self):
+        self.r.commit({"a.py": "x\n"}, "a\n\nCo-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>\n")
+        self.r.commit({"b.py": "x\n"}, "b\n\nCo-authored-by: copilot-swe-agent[bot] "
+                                       "<198982749+Copilot@users.noreply.github.com>\n")
+        c1, c2 = self.walk()
+        self.assertEqual([u.name for u in c1.uses], ["GitHub Copilot code review"])
+        self.assertEqual([u.name for u in c2.uses], ["GitHub Copilot coding agent"])
+        self.assertEqual(c2.uses[0].kind, aiprov.KIND_CODING)
+
+    def test_repeated_squash_lines_make_one_use(self):
+        line = ("Co-authored-by: gemini-code-assist[bot] "
+                "<176961590+gemini-code-assist[bot]@users.noreply.github.com>")
+        self.r.commit({"a.py": lines(4)}, f"Squash\n\n* one\n\n{line}\n\n* two\n\n{line}\n\n{line}\n")
+        (c,) = self.walk()
+        self.assertEqual(len(c.uses), 1)
+        self.assertEqual(c.uses[0].traces, [line])
+
+    def test_review_bot_does_not_add_ai_lines(self):
+        self.r.commit({"a.py": lines(4)},
+                      "apply\n\nCo-authored-by: coderabbitai[bot] "
+                      "<136622811+coderabbitai[bot]@users.noreply.github.com>\n")
+        (c,) = self.walk()
+        self.assertEqual(c.basis, "none")
+        self.assertEqual(c.ai_lines, {})
+        self.assertEqual(c.review_lines, {"a.py": 4})
+        files, tools = aiprov.aggregate([c])
+        self.assertEqual(files["a.py"]["ai_lines"], 0)
+        self.assertEqual(files["a.py"]["ai_commits"], [])
+        self.assertEqual(files["a.py"]["review_lines"], 4)
+        self.assertEqual(files["a.py"]["review_tools"], {"CodeRabbit"})
+
+    def test_mixed_commit_keeps_both_kinds_apart(self):
+        self.r.commit({"a.py": lines(5)},
+                      "feat\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
+                      "Co-authored-by: sourcery-ai[bot] <58596630+sourcery-ai[bot]@users.noreply.github.com>\n")
+        (c,) = self.walk()
+        self.assertEqual({u.name: u.kind for u in c.uses},
+                         {"Claude Code": aiprov.KIND_CODING, "Sourcery": aiprov.KIND_REVIEW})
+        files, _ = aiprov.aggregate([c])
+        e = files["a.py"]
+        self.assertEqual(e["tools"], {"Claude Code"})
+        self.assertEqual(e["review_tools"], {"Sourcery"})
+        self.assertEqual((e["ai_lines"], e["review_lines"]), (5, 5))
+
+    def _setup_outputs(self):
+        self.r.commit({"a.py": lines(3)},
+                      f"feat {SECRET}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n")
+        self.r.commit({"b.py": lines(2)},
+                      f"apply {SECRET}\n\nCo-authored-by: gemini-code-assist[bot] "
+                      "<176961590+gemini-code-assist[bot]@users.noreply.github.com>\n")
+        self.r.git("tag", "v2")
+
+    def test_cyclonedx_separates_kinds(self):
+        self._setup_outputs()
+        code, out, err = run_cli("--repo", self.r.path, "--since", "v1", "--until", "v2")
+        self.assertEqual(code, 0, err)
+        bom = json.loads(out)
+        svcs = {s["name"]: {p["name"]: p["value"] for p in s["properties"]}
+                for s in bom["formulation"][0]["services"]}
+        self.assertEqual(svcs["Claude Code"]["aiprov:kind"], aiprov.KIND_CODING)
+        self.assertEqual(svcs["Gemini Code Assist"]["aiprov:kind"], aiprov.KIND_REVIEW)
+        by_name = {c["name"]: {p["name"]: p["value"] for p in c["properties"]}
+                   for c in bom["components"]}
+        self.assertEqual(by_name["a.py"]["AI Generated"], "true")
+        self.assertNotIn("aiprov:review.lines", by_name["a.py"])
+        self.assertNotIn("AI Generated", by_name["b.py"])
+        self.assertEqual(by_name["b.py"]["aiprov:review.lines"], "2")
+        self.assertEqual(by_name["b.py"]["aiprov:review.bots"], "Gemini Code Assist")
+        rel = {p["name"]: p["value"] for p in bom["metadata"]["component"]["properties"]}
+        self.assertEqual((rel["aiprov:commits.ai"], rel["aiprov:commits.review"]), ("1", "1"))
+        self.assertEqual((rel["aiprov:files.ai"], rel["aiprov:files.review"]), ("1", "1"))
+        self.assertEqual(rel["AI Generated"], "true")
+        props = [p for p in bom["formulation"][0]["properties"] if p["name"] == "aiprov:review.commit"]
+        self.assertEqual(len(props), 1)
+        self.assertNotIn(SECRET, out)
+
+    def test_cyclonedx_review_only_is_not_ai_generated(self):
+        self.r.commit({"b.py": lines(2)}, "apply\n\nCo-authored-by: coderabbitai[bot] "
+                      "<136622811+coderabbitai[bot]@users.noreply.github.com>\n")
+        _, out, _ = run_cli("--repo", self.r.path, "--since", "v1")
+        bom = json.loads(out)
+        rel = {p["name"]: p["value"] for p in bom["metadata"]["component"]["properties"]}
+        self.assertEqual(rel["AI Generated"], "false")
+
+    def test_spdx_separates_kinds(self):
+        self._setup_outputs()
+        _, out, _ = run_cli("--repo", self.r.path, "--since", "v1", "--until", "v2",
+                            "--format", "spdx")
+        graph = json.loads(out)["@graph"]
+        tools = {g["name"]: g for g in graph if g["type"] == "Tool" and "summary" in g}
+        self.assertTrue(tools["Gemini Code Assist"]["summary"].startswith(aiprov.KIND_REVIEW))
+        self.assertEqual(tools["Gemini Code Assist"]["comment"], f"aiprov:kind={aiprov.KIND_REVIEW}")
+        self.assertTrue(tools["Claude Code (Claude Opus 5.5)"]["summary"].startswith(aiprov.KIND_CODING))
+        gen = [g for g in graph if g["type"] == "Relationship" and g["relationshipType"] == "generates"]
+        self.assertEqual(len(gen), 1)  # only the coding tool
+        self.assertEqual(gen[0]["from"], tools["Claude Code (Claude Opus 5.5)"]["spdxId"])
+        anns = [g["statement"] for g in graph if g["type"] == "Annotation"]
+        self.assertEqual(len([a for a in anns if a.startswith("AI Generated")]), 1)
+        self.assertEqual(len([a for a in anns if a.startswith("AI review bot suggestion")]), 1)
+        ids = {g["spdxId"] for g in graph if "spdxId" in g}
+        doc = next(g for g in graph if g["type"] == "SpdxDocument")
+        self.assertEqual(set(doc["element"]), ids - {doc["spdxId"]})
+        self.assertNotIn(SECRET, out)
+
+    def test_markdown_has_its_own_section(self):
+        self._setup_outputs()
+        _, out, _ = run_cli("--repo", self.r.path, "--since", "v1", "--until", "v2",
+                            "--format", "md")
+        head, _, tail = out.partition("## AI review bots (applied suggestions)")
+        self.assertTrue(tail)
+        self.assertIn("| Claude Code | Claude Opus 5.5 |", head)
+        self.assertNotIn("Gemini Code Assist", head)
+        self.assertNotIn("`b.py`", head)
+        self.assertIn("| Gemini Code Assist | Google | 1 | trailer |", tail)
+        self.assertIn("`b.py`", tail)
+        self.assertIn("Lines added: 5. Counted as AI: 3.", out)
+        self.assertNotIn(SECRET, out)
+
+    def test_markdown_mixed_commit_bot_not_in_coding_table(self):
+        self.r.commit({"a.py": lines(5)},
+                      "feat\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
+                      "Co-authored-by: sourcery-ai[bot] <58596630+sourcery-ai[bot]@users.noreply.github.com>\n")
+        _, out, _ = run_cli("--repo", self.r.path, "--since", "v1", "--format", "md")
+        head, _, tail = out.partition("## AI review bots (applied suggestions)")
+        self.assertNotIn("Sourcery", head)
+        self.assertIn("| Sourcery |", tail)
+        self.assertIn("With an AI coding tool trace: 1.", out)
+
+    def test_markdown_none_when_no_review_bot(self):
+        self.r.commit({"a.py": "x\n"}, "h")
+        _, out, _ = run_cli("--repo", self.r.path, "--since", "v1", "--format", "md")
+        self.assertIn("## AI review bots (applied suggestions)", out)
+        self.assertIn("With an AI review bot as co-author (counted apart, see below): 0.", out)
+
+    def test_policy_applies_to_review_bots(self):
+        self._setup_outputs()
+        pol = os.path.join(self.r.path, ".git", "policy.json")
+
+        def write(obj):
+            with open(pol, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh)
+
+        write({"allowed_tools": ["Claude Code"], "allowed_providers": ["Anthropic"]})
+        code, out, err = run_cli("--repo", self.r.path, "--since", "v1", "--until", "v2",
+                                 "--policy", pol, "--format", "md")
+        self.assertEqual(code, 1)
+        self.assertIn("Gemini Code Assist", err)
+        self.assertIn(aiprov.KIND_REVIEW, err)
+        self.assertIn("tool 'Gemini Code Assist' is not on the allowed list", err)
+        self.assertIn("provider 'Google' is not on the allowed list", err)
+        self.assertIn("**Fail.**", out)
+        write({"allowed_tools": ["Claude Code", "review:gemini-code-assist"],
+               "allowed_providers": ["Anthropic", "Google"]})
+        code, out, err = run_cli("--repo", self.r.path, "--since", "v1", "--until", "v2",
+                                 "--policy", pol, "--format", "md")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Pass.", out)
+        write({"allowed_tools": ["Claude Code", "Gemini Code Assist"],
+               "allowed_providers": ["Anthropic", "Google"]})
+        code, _, err = run_cli("--repo", self.r.path, "--since", "v1", "--until", "v2",
+                               "--policy", pol, "--format", "md")
+        self.assertEqual(code, 0, err)
+
+
 SCHEMA_DIR = os.environ.get("AIPROV_SCHEMA_DIR")
 try:
     import jsonschema  # noqa: F401  (optional, not needed by aiprov itself)

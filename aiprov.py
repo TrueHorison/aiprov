@@ -5,6 +5,9 @@ Reads commit trailers and git-ai notes (refs/notes/ai) between two refs and
 writes a CycloneDX 1.6 SBOM, an SPDX 3.0.1 document, or a Markdown summary.
 Optionally checks the AI use against an allow-list (policy.json).
 
+It keeps two kinds apart: AI coding tools, and AI review bots whose suggestions were
+applied (a "Co-authored-by" line from a bot such as gemini-code-assist[bot]).
+
 Stdlib only. Calls git through subprocess. Never outputs commit message
 text other than the AI trailer lines it recognises, and never outputs diffs.
 
@@ -23,7 +26,11 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+
+# What kind of AI use a finding is. The two kinds are kept apart in every output.
+KIND_CODING = "AI coding tool"
+KIND_REVIEW = "AI review bot (applied suggestion)"
 
 # --------------------------------------------------------------------------
 # Known tools. key -> (display name, tool vendor or None)
@@ -37,6 +44,41 @@ TOOLS = {
     "codex": ("OpenAI Codex", "OpenAI"),
     "aider": ("Aider", None),  # open source, runs locally; provider = model's
 }
+
+# AI review bots. A bot like this posts a code suggestion on a pull request. When a
+# person clicks "Commit suggestion", GitHub adds the bot as a co-author of that commit.
+# The bot did not write the commit: it wrote the suggested lines inside it.
+# key -> (display name, vendor). The key starts with "review:".
+REVIEW_BOTS = {
+    "review:gemini-code-assist": ("Gemini Code Assist", "Google"),
+    "review:coderabbit": ("CodeRabbit", "CodeRabbit"),
+    "review:copilot-review": ("GitHub Copilot code review", "GitHub"),
+    "review:sourcery": ("Sourcery", "Sourcery"),
+    "review:qodo": ("Qodo code review", "Qodo"),
+    "review:greptile": ("Greptile", "Greptile"),
+    "review:cubic": ("cubic", "cubic"),
+    "review:codex-review": ("OpenAI Codex code review", "OpenAI"),
+}
+
+# The bot's account name (the part of its noreply email before the "@", without any
+# leading "<id>+" and without a trailing "[bot]") -> key in REVIEW_BOTS.
+# The email decides, not the display name: the same account shows up under other
+# names (for example "Antigravity" or "Codex (<model>)").
+REVIEW_BOT_LOGINS = {
+    "gemini-code-assist": "review:gemini-code-assist",
+    "coderabbitai": "review:coderabbit",
+    "coderabbiteu": "review:coderabbit",
+    "copilot-pull-request-reviewer": "review:copilot-review",
+    "sourcery-ai": "review:sourcery",
+    "qodo-code-review": "review:qodo",
+    "greptile-apps": "review:greptile",
+    "cubic-dev-ai": "review:cubic",
+    "chatgpt-codex-connector": "review:codex-review",
+}
+REVIEW_EMAIL_DOMAINS = {"users.noreply.github.com", "github.com"}
+# GitHub account id of the Copilot code review bot. Its commits and co-author lines
+# show the name "Copilot", which looks like the Copilot coding agent (id 198982749).
+COPILOT_REVIEW_ID = "175728472"
 
 # git-ai agent_id.tool values -> our tool keys. Unknown values pass through.
 GITAI_TOOL_MAP = {
@@ -74,12 +116,26 @@ NAME_PROVIDERS = [
     (re.compile(r"^gemini\b", re.I), "Google"),
 ]
 
-COPILOT_EMAIL = re.compile(r"^\d+\+Copilot@users\.noreply\.github\.com$", re.I)
+COPILOT_EMAIL = re.compile(r"^(?!" + COPILOT_REVIEW_ID + r"\+)\d+\+Copilot@users\.noreply\.github\.com$", re.I)
+COPILOT_REVIEW_EMAIL = re.compile(r"^" + COPILOT_REVIEW_ID + r"\+Copilot@users\.noreply\.github\.com$", re.I)
 CLAUDE_GH_EMAIL = re.compile(r"^\d+\+Claude@users\.noreply\.github\.com$", re.I)
 TRAILER_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):[ \t]+(\S.*?)\s*$")
 NAME_EMAIL = re.compile(r"^(.*?)\s*<([^>]*)>\s*$")
 AIDER_CO = re.compile(r"^aider\s*\((.*)\)$", re.I)
 KEPT_KEYS = {"co-authored-by", "claude-session", "agent-logs-url", "made-with", "assisted-by"}
+
+
+def review_bot_key(email: str | None) -> str | None:
+    """Key of the AI review bot that owns this email, or None."""
+    email = (email or "").strip()
+    local, _, domain = email.lower().partition("@")
+    if domain not in REVIEW_EMAIL_DOMAINS:
+        return None
+    if COPILOT_REVIEW_EMAIL.match(email):
+        return "review:copilot-review"
+    local = re.sub(r"^\d+\+", "", local)
+    local = re.sub(r"\[bot\]$", "", local)
+    return REVIEW_BOT_LOGINS.get(local)
 
 
 def model_provider(model: str | None) -> str | None:
@@ -103,6 +159,11 @@ class Use:
     model: str | None
     evidence: str  # "trailer" or "note"
     traces: list = field(default_factory=list)  # the trailer lines that prove it
+    kind: str = KIND_CODING
+
+    @property
+    def is_review(self) -> bool:
+        return self.kind == KIND_REVIEW
 
     @property
     def model_provider(self) -> str | None:
@@ -116,13 +177,19 @@ class Use:
         return out
 
     def ident(self) -> tuple:
-        return (self.name, self.model or "", self.vendor or "", self.model_provider or "")
+        return (self.name, self.model or "", self.vendor or "", self.model_provider or "",
+                self.kind)
 
 
 def make_use(key, evidence, model=None, trace=None, name=None):
-    disp, vendor = TOOLS.get(key, (name or key, None))
+    kind = KIND_CODING
+    if key in REVIEW_BOTS:
+        disp, vendor = REVIEW_BOTS[key]
+        kind = KIND_REVIEW
+    else:
+        disp, vendor = TOOLS.get(key, (name or key, None))
     return Use(key=key, name=disp, vendor=vendor, model=model, evidence=evidence,
-               traces=[trace] if trace else [])
+               traces=[trace] if trace else [], kind=kind)
 
 
 @dataclass
@@ -140,7 +207,8 @@ class Commit:
     uses: list
     files: list  # FileStat
     ai_lines: dict  # path -> int (AI-attributed added lines in this commit)
-    basis: str  # "note", "trailer" or "none"
+    basis: str  # "note", "trailer" or "none" (about coding tools only)
+    review_lines: dict = field(default_factory=dict)  # path -> lines added, when a review bot co-authored
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +262,8 @@ def detect_trailers(author_name, author_email, committer_name, subject, trailers
 
     is_copilot_author = bool(COPILOT_EMAIL.match(author_email or ""))
     is_claude_gh_author = bool(CLAUDE_GH_EMAIL.match(author_email or ""))
+    if COPILOT_REVIEW_EMAIL.match(author_email or ""):
+        add("review:copilot-review", f"Author: {author_name} <{author_email}>")
     if is_copilot_author:
         add("copilot-agent", f"Author: {author_name} <{author_email}>")
     if is_claude_gh_author:
@@ -230,7 +300,10 @@ def detect_trailers(author_name, author_email, committer_name, subject, trailers
             if not m:
                 continue
             name, email = m.group(1).strip(), m.group(2).strip().lower()
-            if email == "noreply@anthropic.com":
+            review_key = review_bot_key(email)
+            if review_key:
+                add(review_key, line)
+            elif email == "noreply@anthropic.com":
                 model = None
                 if name.lower().startswith("claude") and name.lower() not in ("claude", "claude code"):
                     model = name
@@ -438,12 +511,15 @@ def walk(repo, since, until) -> list:
                     for path, n in per_file.items():
                         ai_lines[path] = min(n, added.get(path, n))
                     basis = "note"
-        if basis == "none" and uses:
+        # Review bots are counted apart from coding tools: they only change basis
+        # and ai_lines if a coding tool is also there.
+        if basis == "none" and any(not u.is_review for u in uses):
             basis = "trailer"
             for f in files:
                 ai_lines[f.path] = f.added
+        review_lines = {f.path: f.added for f in files} if any(u.is_review for u in uses) else {}
         commits.append(Commit(sha=sha, date=date, uses=uses, files=files,
-                              ai_lines=ai_lines, basis=basis))
+                              ai_lines=ai_lines, basis=basis, review_lines=review_lines))
     commits.reverse()  # oldest first
     return commits
 
@@ -455,7 +531,8 @@ def aggregate(commits):
     files: dict = {}
     tools: dict = {}
     for c in commits:
-        tool_names = sorted({u.name for u in c.uses})
+        tool_names = sorted({u.name for u in c.uses if not u.is_review})
+        review_names = sorted({u.name for u in c.uses if u.is_review})
         for u in c.uses:
             t = tools.setdefault(u.ident(), {"use": u, "commits": [], "evidence": set()})
             t["commits"].append(c.sha)
@@ -463,7 +540,9 @@ def aggregate(commits):
         for f in c.files:
             e = files.setdefault(f.path, {"path": f.path, "added": 0, "deleted": 0,
                                           "ai_lines": 0, "basis": set(), "tools": set(),
-                                          "ai_commits": [], "binary": False})
+                                          "ai_commits": [], "binary": False,
+                                          "review_lines": 0, "review_tools": set(),
+                                          "review_commits": []})
             e["added"] += f.added
             e["deleted"] += f.deleted
             e["binary"] = e["binary"] or f.binary
@@ -473,6 +552,10 @@ def aggregate(commits):
                 e["basis"].add(c.basis)
                 e["tools"].update(tool_names)
                 e["ai_commits"].append(c.sha)
+            if review_names and f.path in c.review_lines:
+                e["review_lines"] += c.review_lines[f.path]
+                e["review_tools"].update(review_names)
+                e["review_commits"].append(c.sha)
     return files, tools
 
 
@@ -516,7 +599,7 @@ def check_policy(policy, commits) -> list:
                         reasons.append(f"provider '{p}' is not on the allowed list")
             if reasons:
                 problems.append({"commit": c.sha, "tool": u.name, "model": u.model,
-                                 "reasons": reasons})
+                                 "kind": u.kind, "reasons": reasons})
     return problems
 
 
@@ -557,7 +640,8 @@ def build_cyclonedx(rel, commits, files, tools, repo, until):
         svc = {"bom-ref": ref, "name": u.name}
         if u.vendor:
             svc["provider"] = {"name": u.vendor}
-        props = [{"name": "aiprov:model", "value": u.model or "not recorded"},
+        props = [{"name": "aiprov:kind", "value": u.kind},
+                 {"name": "aiprov:model", "value": u.model or "not recorded"},
                  {"name": "aiprov:model.provider", "value": u.model_provider or "not recorded"},
                  {"name": "aiprov:evidence", "value": ",".join(sorted(t["evidence"]))},
                  {"name": "aiprov:commit.count", "value": str(len(t["commits"]))}]
@@ -589,6 +673,15 @@ def build_cyclonedx(rel, commits, files, tools, repo, until):
                 {"name": "aiprov:ai.tools", "value": "; ".join(sorted(e["tools"]))},
                 {"name": "aiprov:ai.commits", "value": ",".join(s[:12] for s in e["ai_commits"])},
             ]
+        if e["review_commits"]:
+            # Kept apart from the AI Generated flag: a bot wrote suggested lines inside
+            # these commits, not the commits as a whole.
+            props += [
+                {"name": "aiprov:review.lines", "value": str(e["review_lines"])},
+                {"name": "aiprov:review.bots", "value": "; ".join(sorted(e["review_tools"]))},
+                {"name": "aiprov:review.commits",
+                 "value": ",".join(s[:12] for s in e["review_commits"])},
+            ]
         c["properties"] = props
         comps.append(c)
 
@@ -597,11 +690,12 @@ def build_cyclonedx(rel, commits, files, tools, repo, until):
         if not c.uses:
             continue
         for u in c.uses:
-            commit_props.append({"name": "aiprov:commit",
+            commit_props.append({"name": "aiprov:review.commit" if u.is_review else "aiprov:commit",
                                  "value": f"{c.sha} | {tool_label(u)} | {u.evidence} | "
                                           + " ; ".join(u.traces)})
 
     ai_files = sum(1 for e in files.values() if e["ai_commits"])
+    review_files = sum(1 for e in files.values() if e["review_commits"])
     bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
@@ -618,8 +712,12 @@ def build_cyclonedx(rel, commits, files, tools, repo, until):
                     {"name": "aiprov:range", "value": f"{rel['since']}..{rel['until']}"},
                     {"name": "aiprov:release.commit", "value": rel["commit"]},
                     {"name": "aiprov:commits.total", "value": str(len(commits))},
-                    {"name": "aiprov:commits.ai", "value": str(sum(1 for c in commits if c.uses))},
+                    {"name": "aiprov:commits.ai",
+                     "value": str(sum(1 for c in commits if any(not u.is_review for u in c.uses)))},
+                    {"name": "aiprov:commits.review",
+                     "value": str(sum(1 for c in commits if any(u.is_review for u in c.uses)))},
                     {"name": "aiprov:files.ai", "value": str(ai_files)},
+                    {"name": "aiprov:files.review", "value": str(review_files)},
                     {"name": "AI Generated",
                      "value": "true" if ai_files else "false"},
                 ],
@@ -684,12 +782,13 @@ def build_spdx(rel, commits, files, tools, repo, until):
     for i, (ident, t) in enumerate(sorted(tools.items(), key=lambda kv: kv[0])):
         u = t["use"]
         tid = f"{ns}#ai-tool-{i + 1}"
-        summary = (f"AI coding tool. model: {u.model or 'not recorded'}; "
+        summary = (f"{u.kind}. model: {u.model or 'not recorded'}; "
                    f"tool vendor: {u.vendor or 'not recorded'}; "
                    f"model provider: {u.model_provider or 'not recorded'}; "
                    f"evidence: {','.join(sorted(t['evidence']))}")
         graph.append({"type": "Tool", "spdxId": tid, "creationInfo": ci,
-                      "name": tool_label(u), "summary": summary})
+                      "name": tool_label(u), "summary": summary,
+                      "comment": f"aiprov:kind={u.kind}"})
         elements.append(tid)
         # release usesTool AI tool
         rid = relid()
@@ -697,9 +796,12 @@ def build_spdx(rel, commits, files, tools, repo, until):
                       "from": pkg_id, "relationshipType": "usesTool", "to": [tid]})
         elements.append(rid)
         # AI tool generates files (files touched by commits that used it)
-        touched = sorted({f.path for c in commits for f in c.files
-                          if c.sha in t["commits"] and f.path in file_ids
-                          and (c.basis == "trailer" or f.path in c.ai_lines)})
+        # A review bot did not write whole files, so it gets no "generates" link.
+        # Its commits are listed in the review annotations below.
+        touched = [] if u.is_review else sorted(
+            {f.path for c in commits for f in c.files
+             if c.sha in t["commits"] and f.path in file_ids
+             and (c.basis == "trailer" or f.path in c.ai_lines)})
         if touched:
             rid = relid()
             graph.append({"type": "Relationship", "spdxId": rid, "creationInfo": ci,
@@ -736,6 +838,20 @@ def build_spdx(rel, commits, files, tools, repo, until):
                                     f"{','.join(s[:12] for s in e['ai_commits'])}")})
         elements.append(aid)
 
+    for path in sorted(files):
+        e = files[path]
+        if not e["review_commits"]:
+            continue
+        aid = f"{ns}#rev-{hashlib.sha1(path.encode()).hexdigest()[:16]}"
+        graph.append({"type": "Annotation", "spdxId": aid, "creationInfo": ci,
+                      "annotationType": "other", "subject": file_ids[path],
+                      "statement": (f"AI review bot suggestion (not AI Generated). "
+                                    f"lines_in_commits={e['review_lines']} of "
+                                    f"lines_added={e['added']}; bots="
+                                    f"{'; '.join(sorted(e['review_tools']))}; commits="
+                                    f"{','.join(s[:12] for s in e['review_commits'])}")})
+        elements.append(aid)
+
     doc_id = f"{ns}#document"
     graph.append({"type": "SpdxDocument", "spdxId": doc_id, "creationInfo": ci,
                   "name": f"AI provenance for {rel['name']} {rel['version']}",
@@ -746,8 +862,12 @@ def build_spdx(rel, commits, files, tools, repo, until):
 
 
 def build_markdown(rel, commits, files, tools, problems, policy_used):
-    ai_commits = [c for c in commits if c.uses]
+    ai_commits = [c for c in commits if any(not u.is_review for u in c.uses)]
+    review_commits = [c for c in commits if any(u.is_review for u in c.uses)]
     ai_files = [e for e in files.values() if e["ai_commits"]]
+    review_files = [e for e in files.values() if e["review_commits"]]
+    coding_tools = {k: t for k, t in tools.items() if not t["use"].is_review}
+    review_tools = {k: t for k, t in tools.items() if t["use"].is_review}
     total_added = sum(e["added"] for e in files.values())
     ai_added = sum(e["ai_lines"] for e in ai_files)
     out = []
@@ -755,23 +875,24 @@ def build_markdown(rel, commits, files, tools, problems, policy_used):
     w(f"# AI use in {rel['name']} {rel['version']}")
     w("")
     w(f"- Range: `{rel['since']}..{rel['until']}` (ends at `{rel['commit'][:12]}`)")
-    w(f"- Commits: {len(commits)} (merge commits skipped). With an AI trace: {len(ai_commits)}.")
+    w(f"- Commits: {len(commits)} (merge commits skipped). With an AI coding tool trace: {len(ai_commits)}.")
+    w(f"- With an AI review bot as co-author (counted apart, see below): {len(review_commits)}.")
     w(f"- Files changed: {len(files)}. Touched by AI commits: {len(ai_files)}.")
     w(f"- Lines added: {total_added}. Counted as AI: {ai_added}.")
     w(f"- Made by aiprov {VERSION} on {now_utc()}.")
     w("")
     w("## AI tools seen")
     w("")
-    if tools:
+    if coding_tools:
         w("| Tool | Model | Tool vendor | Model provider | Commits | Evidence |")
         w("|---|---|---|---|---|---|")
-        for ident, t in sorted(tools.items(), key=lambda kv: kv[0]):
+        for ident, t in sorted(coding_tools.items(), key=lambda kv: kv[0]):
             u = t["use"]
             w(f"| {u.name} | {u.model or 'not recorded'} | {u.vendor or '-'} | "
               f"{u.model_provider or 'not recorded'} | {len(t['commits'])} | "
               f"{', '.join(sorted(t['evidence']))} |")
     else:
-        w("No AI traces found in this range.")
+        w("No AI coding tool traces found in this range.")
     w("")
     w("## Files touched by AI commits")
     w("")
@@ -791,8 +912,40 @@ def build_markdown(rel, commits, files, tools, problems, policy_used):
         w("|---|---|---|---|")
         for c in ai_commits:
             for u in c.uses:
+                if u.is_review:
+                    continue
                 tr = "<br>".join(t.replace("|", "\\|") for t in u.traces)
                 w(f"| `{c.sha[:12]}` | {c.date[:10]} | {tool_label(u)} | {u.evidence}: {tr} |")
+    else:
+        w("None.")
+    w("")
+    w("## AI review bots (applied suggestions)")
+    w("")
+    w("A review bot posts a suggested change on a pull request. A person then applies it, and "
+      "GitHub adds the bot as a co-author. The bot wrote the suggested lines, not the whole "
+      "commit. These are not counted in \"Counted as AI\" above.")
+    w("")
+    if review_tools:
+        w("| Bot | Vendor | Commits | Evidence |")
+        w("|---|---|---|---|")
+        for ident, t in sorted(review_tools.items(), key=lambda kv: kv[0]):
+            u = t["use"]
+            w(f"| {u.name} | {u.vendor or '-'} | {len(t['commits'])} | "
+              f"{', '.join(sorted(t['evidence']))} |")
+        w("")
+        w("| Commit | Date | Bot | Evidence |")
+        w("|---|---|---|---|")
+        for c in review_commits:
+            for u in c.uses:
+                if u.is_review:
+                    tr = "<br>".join(t.replace("|", "\\|") for t in u.traces)
+                    w(f"| `{c.sha[:12]}` | {c.date[:10]} | {u.name} | {u.evidence}: {tr} |")
+        w("")
+        w("| File | Lines added | Lines in those commits | Bots |")
+        w("|---|---|---|---|")
+        for e in sorted(review_files, key=lambda e: e["path"]):
+            w(f"| `{e['path']}` | {e['added']} | {e['review_lines']} | "
+              f"{'; '.join(sorted(e['review_tools']))} |")
     else:
         w("None.")
     w("")
@@ -807,13 +960,18 @@ def build_markdown(rel, commits, files, tools, problems, policy_used):
         w("")
         for p in problems:
             w(f"- `{p['commit'][:12]}` {p['tool']}"
-              + (f" ({p['model']})" if p["model"] else "") + ": " + "; ".join(p["reasons"]))
+              + (f" ({p['model']})" if p["model"] else "")
+              + (f" [{p['kind']}]" if p["kind"] == KIND_REVIEW else "")
+              + ": " + "; ".join(p["reasons"]))
     w("")
     w("## How to read this")
     w("")
     w("- **note**: a git-ai note (refs/notes/ai) lists the exact lines the AI wrote.")
     w("- **trailer**: a commit stamp names the AI tool, but not which lines. All lines added "
       "in that commit are counted as AI, so this is an upper bound.")
+    w("- **review bot**: a commit that lists an AI review bot as co-author contains lines the bot "
+      "suggested. The other lines in that commit may be human. Its lines are listed apart and "
+      "never added to the AI line count.")
     w("- Line counts are lines added across commits, not lines left at the end of the range.")
     w("- This report only sees AI use that left a trace. It does not guess from code style.")
     return "\n".join(out) + "\n"
@@ -877,6 +1035,7 @@ def main(argv=None) -> int:
         print(f"aiprov: policy check FAILED: {len(problems)} AI use(s) not allowed", file=sys.stderr)
         for p in problems:
             print(f"  {p['commit']}  {p['tool']}" + (f" ({p['model']})" if p["model"] else "")
+                  + (f" [{p['kind']}]" if p["kind"] == KIND_REVIEW else "")
                   + ": " + "; ".join(p["reasons"]), file=sys.stderr)
         return 1
     return 0
