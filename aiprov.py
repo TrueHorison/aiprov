@@ -11,12 +11,17 @@ applied (a "Co-authored-by" line from a bot such as gemini-code-assist[bot]).
 Stdlib only. Calls git through subprocess. Never outputs commit message
 text other than the AI trailer lines it recognises, and never outputs diffs.
 
+Also checks AI use before code leaves your machine:
+  aiprov.py hook-install --policy policy.json [--remote PATTERN]   (git pre-push hook)
+  aiprov.py check --policy policy.json --range A..B                (same check, for CI)
+
 Exit codes: 0 = ok, 1 = policy check failed, 2 = usage or git error.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import fnmatch
 import hashlib
 import json
 import os
@@ -26,7 +31,7 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # What kind of AI use a finding is. The two kinds are kept apart in every output.
 KIND_CODING = "AI coding tool"
@@ -479,10 +484,22 @@ def parse_numstat(raw: bytes) -> dict:
 
 def walk(repo, since, until) -> list:
     rng = f"{since}..{until}" if since else until
+    return walk_revs(repo, [rng])
+
+
+def walk_revs(repo, revs, merges=False, stats=True) -> list:
+    """Commits for a list of git rev arguments (for example ["A..B"]).
+
+    merges=True keeps merge commits (the push check wants them: a stamped merge is stamped).
+    stats=False skips file and line counts (the push check does not need them).
+    """
     fmt = "%x1e%H%x1f%cI%x1f%an%x1f%ae%x1f%cn%x1f%B"
-    raw = git_text(repo, "log", "--no-merges", f"--format={fmt}", rng)
-    numstat = parse_numstat(git(repo, "log", "--no-merges", "-M", "--numstat", "-z",
-                                "--format=%x1e%H", rng))
+    nm = [] if merges else ["--no-merges"]
+    raw = git_text(repo, "log", *nm, f"--format={fmt}", *revs, "--")
+    numstat = {}
+    if stats:
+        numstat = parse_numstat(git(repo, "log", *nm, "-M", "--numstat", "-z",
+                                    "--format=%x1e%H", *revs, "--"))
     notes = load_notes(repo)
     commits = []
     for rec in raw.split("\x1e"):
@@ -575,6 +592,13 @@ def load_policy(path):
         pol = json.load(fh)
     if not isinstance(pol, dict):
         raise ValueError("policy must be a JSON object")
+    for key in ("allowed_tools", "allowed_providers"):
+        v = pol.get(key)
+        if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
+            raise ValueError(f"'{key}' must be a list of names")
+    for key in ("allow_unknown_provider", "ban_all_ai"):
+        if key in pol and not isinstance(pol[key], bool):
+            raise ValueError(f"'{key}' must be true or false")
     return pol
 
 
@@ -583,10 +607,16 @@ def check_policy(policy, commits) -> list:
     provs = policy.get("allowed_providers")
     provs_ok = {p.lower() for p in provs} if provs is not None else None
     allow_unknown = bool(policy.get("allow_unknown_provider", False))
+    ban_all = bool(policy.get("ban_all_ai", False))
     problems = []
     for c in commits:
         for u in c.uses:
             reasons = []
+            if ban_all:
+                problems.append({"commit": c.sha, "tool": u.name, "model": u.model,
+                                 "kind": u.kind,
+                                 "reasons": ["AI use is banned by this policy (ban_all_ai)"]})
+                continue
             if u.name.lower() not in tools_ok and u.key.lower() not in tools_ok:
                 reasons.append(f"tool '{u.name}' is not on the allowed list")
             if provs_ok is not None:
@@ -601,6 +631,263 @@ def check_policy(policy, commits) -> list:
                 problems.append({"commit": c.sha, "tool": u.name, "model": u.model,
                                  "kind": u.kind, "reasons": reasons})
     return problems
+
+
+# --------------------------------------------------------------------------
+# Before you push: range check, local log, git pre-push hook
+# --------------------------------------------------------------------------
+HOOK_MARK = "# aiprov-hook v1"
+CHAINED_NAME = "pre-push.pre-aiprov"
+LOG_NAME = "aiprov-log.jsonl"
+
+
+def check_revs(repo, policy, revs):
+    """Check the commits in `revs` against the policy. Merge commits are included.
+
+    Returns (commits_checked, problems)."""
+    for r in revs:
+        if r.startswith("-") and r != "--not" and not r.startswith("--remotes="):
+            raise ValueError(f"not a valid range: {r!r}")
+    commits = walk_revs(repo, revs, merges=True, stats=False)
+    return len(commits), check_policy(policy, commits)
+
+
+def offender_shas(problems) -> list:
+    out = []
+    for p in problems:
+        if p["commit"] not in out:
+            out.append(p["commit"])
+    return out
+
+
+def print_problems(problems, out=None):
+    out = out or sys.stderr
+    for p in problems:
+        print(f"  {p['commit'][:12]}  {p['tool']}" + (f" ({p['model']})" if p["model"] else "")
+              + (f" [{p['kind']}]" if p["kind"] == KIND_REVIEW else "")
+              + ": " + "; ".join(p["reasons"]), file=out)
+
+
+def clean_url(url):
+    """Drop a user name or password from a URL before it goes in the log."""
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@", r"\1", url or "") or None
+
+
+def log_path(repo) -> str:
+    d = git_text(repo, "rev-parse", "--git-common-dir").strip()
+    if not os.path.isabs(d):
+        d = os.path.join(repo, d)
+    return os.path.join(d, LOG_NAME)
+
+
+def log_check(repo, via, remote, url, rng, result, offenders, checked=None):
+    """Append one line to .git/aiprov-log.jsonl. Never writes commit text.
+
+    A log that cannot be written gives a warning, not a different result."""
+    entry = {"time": now_utc(), "via": via, "remote": remote or None, "url": clean_url(url),
+             "range": rng, "result": result, "commits_checked": checked,
+             "offending_commits": offenders}
+    try:
+        with open(log_path(repo), "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    except (OSError, GitError) as exc:
+        print(f"aiprov: warning: could not write the log: {exc}", file=sys.stderr)
+
+
+def remote_matches(patterns, name, url) -> bool:
+    """No patterns: every remote matches. A pattern with * ? or [ is a glob on the remote
+    name or URL. A plain word is the exact remote name, or any URL that contains it."""
+    if not patterns:
+        return True
+    for pat in patterns:
+        p = pat.lower()
+        for cand in (name, url):
+            if cand and fnmatch.fnmatchcase(cand.lower(), p):
+                return True
+        if not any(ch in p for ch in "*?[") and url and p in url.lower():
+            return True
+    return False
+
+
+def is_zero(sha) -> bool:
+    return bool(sha) and set(sha) == {"0"}
+
+
+def have_commit(repo, sha) -> bool:
+    p = subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return p.returncode == 0
+
+
+def push_revs(repo, remote_name, local_sha, remote_sha):
+    """Rev arguments for the commits one pushed ref adds, and a label for the log."""
+    if not is_zero(remote_sha) and have_commit(repo, remote_sha):
+        rng = f"{remote_sha}..{local_sha}"
+        return [rng], rng
+    # New branch, or the remote's commit is not here: take everything the remote's own
+    # tracking branches do not already have. For a bare URL there is nothing to subtract.
+    known = git_text(repo, "remote", check=False).split()
+    if remote_name in known:
+        return ([local_sha, "--not", f"--remotes={remote_name}"],
+                f"{local_sha} --not --remotes={remote_name}")
+    return [local_sha], f"{local_sha} (all history)"
+
+
+def hook_run(args) -> int:
+    """What the pre-push hook calls. Git gives: remote name, remote URL, and lines on stdin."""
+    try:
+        policy = load_policy(args.policy)
+    except (OSError, ValueError) as exc:
+        print(f"aiprov: push refused: cannot read policy: {exc}", file=sys.stderr)
+        return 2
+    name, url = (args.words + ["", ""])[:2]
+    if not remote_matches(args.remote, name, url):
+        log_check(args.repo, "hook", name, url, None, "skipped", [])
+        return 0
+    refused, failed = [], False
+    for line in sys.stdin.read().splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        _lref, local_sha, _rref, remote_sha = parts
+        if is_zero(local_sha):
+            continue  # deleting a branch adds no commits
+        rng = None
+        try:
+            revs, rng = push_revs(args.repo, name, local_sha, remote_sha)
+            checked, problems = check_revs(args.repo, policy, revs)
+        except (GitError, ValueError, FileNotFoundError) as exc:
+            print(f"aiprov: push refused: could not check {rng or local_sha}: {exc}",
+                  file=sys.stderr)
+            log_check(args.repo, "hook", name, url, rng, "error", [])
+            failed = True
+            continue
+        log_check(args.repo, "hook", name, url, rng, "blocked" if problems else "allowed",
+                  offender_shas(problems), checked)
+        refused.extend(problems)
+    if refused:
+        print(f"aiprov: push to '{name}' REFUSED. {len(offender_shas(refused))} commit(s) "
+              "have AI use the policy does not allow:", file=sys.stderr)
+        print_problems(refused)
+        print("Take these commits out of the push, or ask for the tool to be approved.",
+              file=sys.stderr)
+        return 1
+    return 2 if failed else 0
+
+
+def check_main(args) -> int:
+    try:
+        policy = load_policy(args.policy)
+    except (OSError, ValueError) as exc:
+        print(f"aiprov: cannot read policy: {exc}", file=sys.stderr)
+        return 2
+    try:
+        checked, problems = check_revs(args.repo, policy, [args.range])
+    except (GitError, ValueError) as exc:
+        print(f"aiprov: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError:
+        print("aiprov: git was not found on PATH", file=sys.stderr)
+        return 2
+    shas = offender_shas(problems)
+    log_check(args.repo, "check", None, None, args.range,
+              "blocked" if problems else "allowed", shas, checked)
+    if problems:
+        print(f"aiprov: check FAILED: {len(shas)} commit(s) in {args.range} have AI use "
+              "the policy does not allow:", file=sys.stderr)
+        print_problems(problems)
+        return 1
+    print(f"aiprov: check passed: {checked} commit(s) in {args.range}", file=sys.stderr)
+    return 0
+
+
+def sh_quote(s) -> str:
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def slashes(p: str) -> str:
+    return os.path.abspath(p).replace("\\", "/")
+
+
+def hook_script(policy_path, remotes) -> str:
+    cmd = [sh_quote(slashes(sys.executable)), sh_quote(slashes(__file__)),
+           "hook-run", "--policy", sh_quote(slashes(policy_path))]
+    for r in remotes or []:
+        cmd += ["--remote", sh_quote(r)]
+    cmd += ["--", '"$@"']
+    return f"""#!/bin/sh
+{HOOK_MARK}
+# Written by: aiprov.py hook-install. Runs the AI policy check on the commits being pushed.
+# An older pre-push hook, if there was one, was kept as {CHAINED_NAME} and runs after this one.
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+cat > "$tmp"
+{' '.join(cmd)} < "$tmp" || exit $?
+prev="$(dirname "$0")/{CHAINED_NAME}"
+if [ -f "$prev" ]; then
+  "$prev" "$@" < "$tmp" || exit $?
+fi
+exit 0
+"""
+
+
+def hook_install(args) -> int:
+    try:
+        load_policy(args.policy)
+    except (OSError, ValueError) as exc:
+        print(f"aiprov: cannot read policy: {exc}", file=sys.stderr)
+        return 2
+    try:
+        top = git_text(args.repo, "rev-parse", "--show-toplevel", check=False).strip()
+        gitdir = git_text(args.repo, "rev-parse", "--absolute-git-dir").strip()
+        hook = git_text(args.repo, "rev-parse", "--git-path", "hooks/pre-push").strip()
+    except GitError as exc:
+        print(f"aiprov: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError:
+        print("aiprov: git was not found on PATH", file=sys.stderr)
+        return 2
+    if not os.path.isabs(hook):
+        hook = os.path.join(args.repo, hook)
+    hook = os.path.abspath(hook)
+    hooks_dir = os.path.dirname(hook)
+    inside = [os.path.abspath(d) for d in (top, gitdir) if d]
+    try:
+        ok = any(os.path.commonpath([hooks_dir, d]) == d for d in inside)
+    except ValueError:  # different drives
+        ok = False
+    if not ok:
+        print(f"aiprov: git looks for hooks in {hooks_dir}, which is outside this repo "
+              "(core.hooksPath). Not installing, because that would affect other repos.\n"
+              "Add a call to `aiprov.py hook-run --policy <file> -- \"$@\"` to your own hook "
+              "there. Pass git's standard input to it.", file=sys.stderr)
+        return 2
+    chained = os.path.join(hooks_dir, CHAINED_NAME)
+    note = ""
+    if os.path.exists(hook):
+        with open(hook, encoding="utf-8", errors="replace") as fh:
+            ours = HOOK_MARK in fh.read(400)
+        if not ours:
+            if os.path.exists(chained):
+                print(f"aiprov: a pre-push hook already exists at {hook}, and so does "
+                      f"{chained}. Not touching either.\nAdd a call to "
+                      "`aiprov.py hook-run --policy <file> -- \"$@\"` to your hook. "
+                      "Pass git's standard input to it.", file=sys.stderr)
+                return 2
+            os.replace(hook, chained)
+            note = f"\nYour old pre-push hook was kept as {chained}. It runs after the check."
+    os.makedirs(hooks_dir, exist_ok=True)
+    with open(hook, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(hook_script(args.policy, args.remote))
+    os.chmod(hook, 0o755)
+    scope = ("pushes to remotes matching " + ", ".join(repr(r) for r in args.remote)
+             if args.remote else "every push")
+    print(f"aiprov: installed {hook}\nIt checks {scope} against "
+          f"{os.path.abspath(args.policy)}.{note}\n"
+          "Keep the policy file where the people being checked cannot quietly edit it.\n"
+          "To remove it: delete the hook"
+          + (f" and rename {CHAINED_NAME} back to pre-push." if note else "."))
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -980,7 +1267,41 @@ def build_markdown(rel, commits, files, tools, problems, policy_used):
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+def push_cli(argv) -> int:
+    """The three commands that guard a push: hook-install, check, hook-run."""
+    cmd = argv[0]
+    ap = argparse.ArgumentParser(prog=f"aiprov {cmd}")
+    ap.add_argument("--policy", required=True, help="policy.json")
+    ap.add_argument("--repo", default=".", help="path to the git repository (default .)")
+    if cmd == "check":
+        ap.add_argument("--range", required=True, help="commits to check, for example origin/main..HEAD")
+    else:
+        ap.add_argument("--remote", action="append", default=[], metavar="PATTERN",
+                        help="only for remotes whose name or URL matches (glob, or a plain word). "
+                             "May be repeated. Default: every remote")
+    if cmd == "hook-run":
+        ap.add_argument("words", nargs="*", help="remote name and URL, as git passes them")
+    args = ap.parse_args(argv[1:])
+    try:
+        if cmd == "check":
+            return check_main(args)
+        if cmd == "hook-run":
+            return hook_run(args)
+        return hook_install(args)
+    except Exception as exc:  # a failed check must never look like a pass
+        print(f"aiprov: unexpected error: {exc}", file=sys.stderr)
+        return 2
+
+
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+    if argv and argv[0] in ("check", "hook-install", "hook-run"):
+        return push_cli(argv)
     ap = argparse.ArgumentParser(
         prog="aiprov",
         description="List AI coding tools that left a trace in a git range, as an SBOM.")
@@ -992,12 +1313,6 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=".", help="path to the git repository (default .)")
     ap.add_argument("--out", help="write output here instead of standard output")
     args = ap.parse_args(argv)
-
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except (AttributeError, ValueError):
-        pass
 
     since = None if args.since.upper() == "ROOT" else args.since
     try:

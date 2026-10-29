@@ -653,5 +653,335 @@ class TestOfficialSchemas(TestPolicyAndOutput):
         jsonschema.validators.validator_for(schema)(schema).validate(json.loads(out))
 
 
+CLAUDE_STAMP = "Claude-Session: https://claude.ai/code/session_01ABC\n"
+CURSOR_STAMP = "Co-authored-by: Cursor <cursoragent@cursor.com>\n"
+
+
+class PushBase(unittest.TestCase):
+    """A work repo, bare repos as remotes, and real `git push` runs."""
+
+    def setUp(self):
+        self.r = Repo()
+        self.r.commit({"README": "base\n"}, "base")
+        self.tmp = tempfile.mkdtemp(prefix="aiprov-remote-")
+        self.pol = os.path.join(self.tmp, "policy.json")  # outside the work repo
+        self.remotes = {}
+        self.add_remote("client", "clientco-remote")
+
+    def tearDown(self):
+        self.r.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def add_remote(self, name, dirname):
+        path = os.path.join(self.tmp, dirname + ".git")
+        subprocess.run(["git", "init", "--bare", "-q", path], check=True, env=self.r.env)
+        self.r.git("remote", "add", name, path)
+        self.remotes[name] = path
+
+    def policy(self, **obj):
+        with open(self.pol, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+
+    def install(self, *extra):
+        return run_cli("hook-install", "--policy", self.pol, "--repo", self.r.path, *extra)
+
+    def push(self, *args):
+        p = subprocess.run(["git", "-C", self.r.path, "push", *args], capture_output=True,
+                           env=self.r.env)
+        return p.returncode, p.stderr.decode("utf-8", "replace")
+
+    def remote_refs(self, name="client"):
+        p = subprocess.run(["git", "-C", self.remotes[name], "for-each-ref", "--format=%(refname)"],
+                           capture_output=True, env=self.r.env)
+        return p.stdout.decode().split()
+
+    def log_lines(self):
+        path = os.path.join(self.r.path, ".git", "aiprov-log.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(x) for x in fh.read().splitlines()]
+
+    def stamped(self, stamp, name):
+        return self.r.commit({name: lines(2)}, f"work {SECRET}\n\nbody {SECRET}\n\n{stamp}")
+
+
+class TestPushHook(PushBase):
+    def test_blocks_disallowed_tool_and_lists_commits(self):
+        self.policy(allowed_tools=["Claude Code"], allowed_providers=["Anthropic"])
+        self.assertEqual(self.install()[0], 0)
+        bad = self.stamped(CURSOR_STAMP, "a.py")
+        code, err = self.push("client", "main")
+        self.assertNotEqual(code, 0)
+        self.assertIn("REFUSED", err)
+        self.assertIn(bad[:12], err)
+        self.assertIn("Cursor", err)
+        self.assertNotIn(SECRET, err)
+        self.assertEqual(self.remote_refs(), [])  # nothing reached the client
+
+    def test_allows_allowed_and_human_commits(self):
+        self.policy(allowed_tools=["Claude Code", "Cursor"])
+        self.install()
+        self.stamped(CLAUDE_STAMP, "a.py")
+        self.r.commit({"h.txt": "x\n"}, "human only")
+        code, err = self.push("client", "main")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.remote_refs(), ["refs/heads/main"])
+
+    def test_only_new_commits_are_checked(self):
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        first = self.stamped(CLAUDE_STAMP, "a.py")
+        self.assertEqual(self.push("client", "main")[0], 0)
+        second = self.stamped(CURSOR_STAMP, "b.py")
+        code, err = self.push("client", "main")
+        self.assertNotEqual(code, 0)
+        self.assertIn(second[:12], err)
+        self.assertNotIn(first[:12], err)
+
+    def test_new_branch_only_checks_what_the_remote_lacks(self):
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        self.stamped(CLAUDE_STAMP, "a.py")
+        self.assertEqual(self.push("client", "main")[0], 0)
+        self.r.git("checkout", "-q", "-b", "feature")
+        bad = self.stamped(CURSOR_STAMP, "b.py")
+        code, err = self.push("client", "feature")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(err.count("REFUSED"), 1)
+        self.assertIn(bad[:12], err)
+        self.assertEqual(self.remote_refs(), ["refs/heads/main"])
+
+    def test_deleting_a_branch_is_allowed(self):
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        self.r.git("checkout", "-q", "-b", "gone")
+        self.assertEqual(self.push("client", "gone")[0], 0)
+        self.r.git("checkout", "-q", "main")
+        code, err = self.push("client", ":gone")
+        self.assertEqual(code, 0, err)
+
+    def test_remote_pattern_only_guards_matching_remotes(self):
+        self.add_remote("personal", "mine")
+        self.policy(allowed_tools=["Claude Code"])
+        self.assertEqual(self.install("--remote", "client")[0], 0)
+        self.stamped(CURSOR_STAMP, "a.py")
+        self.assertEqual(self.push("personal", "main")[0], 0)  # not guarded
+        self.assertNotEqual(self.push("client", "main")[0], 0)  # guarded
+        self.assertEqual(self.remote_refs("client"), [])
+        self.assertEqual(self.remote_refs("personal"), ["refs/heads/main"])
+        result = [(e["remote"], e["result"]) for e in self.log_lines()]
+        self.assertEqual(result, [("personal", "skipped"), ("client", "blocked")])
+
+    def test_remote_pattern_can_match_the_url(self):
+        self.add_remote("personal", "mine")
+        self.policy(allowed_tools=["Claude Code"])
+        self.install("--remote", "*clientco*")  # glob on the URL
+        self.stamped(CURSOR_STAMP, "a.py")
+        self.assertEqual(self.push("personal", "main")[0], 0)
+        self.assertNotEqual(self.push("client", "main")[0], 0)
+
+    def test_plain_word_matches_name_exactly_or_url_part(self):
+        self.assertTrue(aiprov.remote_matches(["client"], "client", "/x/y"))
+        self.assertFalse(aiprov.remote_matches(["client"], "client2", "/x/y"))
+        self.assertTrue(aiprov.remote_matches(["acme"], "origin", "https://git.acme.com/r.git"))
+        self.assertTrue(aiprov.remote_matches(["*.acme.com/*"], "o", "https://git.acme.com/r.git"))
+        self.assertFalse(aiprov.remote_matches(["acme"], "origin", "https://github.com/me/r.git"))
+        self.assertTrue(aiprov.remote_matches([], "anything", None))
+
+    def test_ban_all_ai(self):
+        self.policy(allowed_tools=["Claude Code", "Cursor"], ban_all_ai=True)
+        self.install()
+        self.r.commit({"h.txt": "x\n"}, "human only")
+        self.assertEqual(self.push("client", "main")[0], 0)  # unstamped is fine
+        bad = self.stamped(CLAUDE_STAMP, "a.py")  # on the allowed list, still banned
+        code, err = self.push("client", "main")
+        self.assertNotEqual(code, 0)
+        self.assertIn(bad[:12], err)
+        self.assertIn("banned", err)
+
+    def test_ban_all_ai_also_fails_the_report_check(self):
+        self.policy(allowed_tools=["Claude Code"], ban_all_ai=True)
+        self.r.git("tag", "v0", "HEAD")
+        self.stamped(CLAUDE_STAMP, "a.py")
+        code, _, err = run_cli("--repo", self.r.path, "--since", "v0", "--policy", self.pol,
+                               "--format", "md")
+        self.assertEqual(code, 1)
+        self.assertIn("banned", err)
+
+    def test_bad_policy_values_are_refused(self):
+        self.policy(ban_all_ai="true")
+        code, _, err = run_cli("check", "--policy", self.pol, "--repo", self.r.path,
+                               "--range", "HEAD")
+        self.assertEqual(code, 2)
+        self.assertIn("ban_all_ai", err)
+        self.assertEqual(self.install()[0], 2)
+
+    def test_stamped_merge_commit_is_seen(self):
+        self.policy(allowed_tools=[], ban_all_ai=True)
+        self.r.git("checkout", "-q", "-b", "side")
+        self.r.commit({"s.txt": "s\n"}, "side work")
+        self.r.git("checkout", "-q", "main")
+        self.r.commit({"m.txt": "m\n"}, "main work")
+        self.r.git("merge", "--no-ff", "-q", "-m", "Merge side\n\n" + CLAUDE_STAMP, "side")
+        merge = self.r.git("rev-parse", "HEAD")
+        code, _, err = run_cli("check", "--policy", self.pol, "--repo", self.r.path,
+                               "--range", "HEAD~2..HEAD")
+        self.assertEqual(code, 1)
+        self.assertIn(merge[:12], err)
+
+    def test_fails_closed_when_policy_is_gone(self):
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        os.remove(self.pol)
+        self.stamped(CLAUDE_STAMP, "a.py")
+        code, err = self.push("client", "main")
+        self.assertNotEqual(code, 0)
+        self.assertIn("cannot read policy", err)
+        self.assertEqual(self.remote_refs(), [])
+
+    def test_hook_outside_repo_is_not_installed(self):
+        self.policy(allowed_tools=[])
+        shared = os.path.join(self.tmp, "shared-hooks")
+        os.makedirs(shared)
+        self.r.git("config", "core.hooksPath", shared)
+        code, _, err = self.install()
+        self.assertEqual(code, 2)
+        self.assertIn("outside this repo", err)
+        self.assertEqual(os.listdir(shared), [])
+
+
+class TestHookChain(PushBase):
+    def hook_path(self, name="pre-push"):
+        return os.path.join(self.r.path, ".git", "hooks", name)
+
+    def write_old_hook(self, exit_code=0):
+        marker = os.path.join(self.tmp, "old-hook-ran")
+        os.makedirs(os.path.dirname(self.hook_path()), exist_ok=True)
+        with open(self.hook_path(), "w", newline="\n") as fh:
+            fh.write("#!/bin/sh\ncat > /dev/null\n"
+                     f"echo \"$1\" > '{marker.replace(os.sep, '/')}'\n"
+                     f"exit {exit_code}\n")
+        os.chmod(self.hook_path(), 0o755)
+        return marker
+
+    def test_existing_hook_is_kept_and_runs_after_the_check(self):
+        marker = self.write_old_hook()
+        self.policy(allowed_tools=["Claude Code"])
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertIn("pre-push.pre-aiprov", out)
+        self.assertTrue(os.path.exists(self.hook_path("pre-push.pre-aiprov")))
+        self.stamped(CLAUDE_STAMP, "a.py")
+        code, err = self.push("client", "main")
+        self.assertEqual(code, 0, err)
+        with open(marker) as fh:
+            self.assertEqual(fh.read().strip(), "client")  # it got git's arguments
+
+    def test_blocked_push_does_not_reach_the_old_hook(self):
+        marker = self.write_old_hook()
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        self.stamped(CURSOR_STAMP, "a.py")
+        self.assertNotEqual(self.push("client", "main")[0], 0)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_failing_old_hook_still_blocks(self):
+        self.write_old_hook(exit_code=1)
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        self.stamped(CLAUDE_STAMP, "a.py")
+        self.assertNotEqual(self.push("client", "main")[0], 0)
+        self.assertEqual(self.remote_refs(), [])
+
+    def test_install_twice_keeps_the_old_hook(self):
+        self.write_old_hook()
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        with open(self.hook_path("pre-push.pre-aiprov")) as fh:
+            old = fh.read()
+        self.assertEqual(self.install("--remote", "client")[0], 0)
+        with open(self.hook_path("pre-push.pre-aiprov")) as fh:
+            self.assertEqual(fh.read(), old)
+        with open(self.hook_path()) as fh:
+            self.assertIn("--remote 'client'", fh.read())
+
+    def test_two_unknown_hooks_are_not_overwritten(self):
+        self.write_old_hook()
+        with open(self.hook_path("pre-push.pre-aiprov"), "w", newline="\n") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        with open(self.hook_path()) as fh:
+            before = fh.read()
+        self.policy(allowed_tools=[])
+        code, _, err = self.install()
+        self.assertEqual(code, 2)
+        self.assertIn("hook-run", err)
+        with open(self.hook_path()) as fh:
+            self.assertEqual(fh.read(), before)
+
+
+class TestCheckAndLog(PushBase):
+    def test_check_range_for_ci(self):
+        self.policy(allowed_tools=["Claude Code"])
+        base = self.r.git("rev-parse", "HEAD")
+        ok = self.stamped(CLAUDE_STAMP, "a.py")
+        code, _, err = run_cli("check", "--policy", self.pol, "--repo", self.r.path,
+                               "--range", f"{base}..{ok}")
+        self.assertEqual(code, 0, err)
+        bad = self.stamped(CURSOR_STAMP, "b.py")
+        code, _, err = run_cli("check", "--policy", self.pol, "--repo", self.r.path,
+                               "--range", f"{base}..{bad}")
+        self.assertEqual(code, 1)
+        self.assertIn(bad[:12], err)
+        self.assertNotIn(SECRET, err)
+
+    def test_check_bad_range_is_an_error_not_a_pass(self):
+        self.policy(allowed_tools=[])
+        for rng in ("nope..HEAD", "--all", "-n1"):
+            code, _, err = run_cli("check", "--policy", self.pol, "--repo", self.r.path,
+                                   "--range=" + rng)
+            self.assertEqual(code, 2, rng)
+
+    def test_log_is_append_only_and_has_no_commit_text(self):
+        self.policy(allowed_tools=["Claude Code"])
+        self.install()
+        ok = self.stamped(CLAUDE_STAMP, "a.py")
+        self.assertEqual(self.push("client", "main")[0], 0)
+        bad = self.stamped(CURSOR_STAMP, "b.py")
+        self.assertNotEqual(self.push("client", "main")[0], 0)
+        run_cli("check", "--policy", self.pol, "--repo", self.r.path, "--range", f"{ok}..{bad}")
+        entries = self.log_lines()
+        self.assertEqual([e["result"] for e in entries], ["allowed", "blocked", "blocked"])
+        first, second, third = entries
+        self.assertEqual(first["offending_commits"], [])
+        self.assertEqual(first["remote"], "client")
+        self.assertEqual(first["via"], "hook")
+        self.assertEqual(second["offending_commits"], [bad])
+        self.assertEqual(second["range"], f"{ok}..{bad}")
+        self.assertEqual(second["commits_checked"], 1)
+        self.assertEqual(third["via"], "check")
+        self.assertIsNone(third["remote"])
+        self.assertTrue(second["time"].endswith("Z"))
+        with open(os.path.join(self.r.path, ".git", "aiprov-log.jsonl"), encoding="utf-8") as fh:
+            raw = fh.read()
+        self.assertNotIn(SECRET, raw)
+        self.assertNotIn("Cursor <", raw)
+        self.assertNotIn("claude.ai", raw)
+
+    def test_log_does_not_keep_url_passwords(self):
+        self.assertEqual(aiprov.clean_url("https://bob:s3cret@git.example.com/r.git"),
+                         "https://git.example.com/r.git")
+        self.assertEqual(aiprov.clean_url("git@example.com:r.git"), "git@example.com:r.git")
+        self.assertIsNone(aiprov.clean_url(None))
+
+    def test_unwritable_log_only_warns(self):
+        self.policy(allowed_tools=["Claude Code"])
+        os.makedirs(os.path.join(self.r.path, ".git", "aiprov-log.jsonl"))  # a folder in the way
+        code, _, err = run_cli("check", "--policy", self.pol, "--repo", self.r.path,
+                               "--range", "HEAD")
+        self.assertEqual(code, 0)
+        self.assertIn("could not write the log", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -205,7 +205,27 @@ This mapping is our choice, not a standard.
 - `allow_unknown_provider`: optional, default `false`. When no provider is known
   (for example Aider with no model named), the use fails unless this is `true`.
 
+- `ban_all_ai`: optional, default `false`. For clients that ban AI. When `true`, any stamped commit fails,
+  whatever the lists say.
+
 If any use fails, aiprov lists the commits on the error stream and exits with `1`.
+
+## Before you push
+
+Some clients want AI tools approved before code reaches them, not a report after.
+
+```
+python aiprov.py hook-install --policy policy.json --remote client
+python aiprov.py check --policy policy.json --range origin/main..HEAD
+```
+
+The first adds a git pre-push hook. It checks the commits you are about to push. If a tool is not allowed, the push is refused and the commits are listed. `--remote` limits this to matching remotes. An old pre-push hook is kept and runs after.
+
+The second does the same check without a hook, for CI.
+
+Every check adds a line to `.git/aiprov-log.jsonl`: time, remote, range, result and commit ids. No commit text.
+
+It only sees stamped commits. `git push --no-verify` skips the hook. For a real gate, run `check` in CI.
 
 ## Limits
 
