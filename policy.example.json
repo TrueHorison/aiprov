@@ -1,0 +1,5 @@
+{
+  "allowed_tools": ["Claude Code", "GitHub Copilot coding agent"],
+  "allowed_providers": ["Anthropic", "GitHub"],
+  "allow_unknown_provider": false
+}
