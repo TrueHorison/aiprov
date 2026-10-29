@@ -25,6 +25,8 @@ A supplier then has to answer three questions per release:
 Coding tools already stamp their commits (see `FORMATS.md`).
 aiprov collects those stamps for a release and writes the answers in the two standard SBOM formats.
 
+If a client of yours asks for this, I'd like to know what they ask for and how you deal with it now. There's a [one-minute form](https://docs.google.com/forms/d/e/1FAIpQLSfHLjfFnQ249a2OB8p0qFRYL87-3nQegEcTcPnOnQ6dJpoPrA/viewform), no sign-in needed.
+
 ## What it does
 
 For each commit between two refs (merge commits are skipped):
